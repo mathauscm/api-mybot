@@ -1,237 +1,218 @@
-const Conversation = require('../models/conversation');
-const botService = require('../services/botService');
+const Catalog = require('../models/catalog');
+const Category = require('../models/category');
+const ProductOption = require('../models/productOption');
 const logger = require('../utils/logger');
+const cacheManager = require('../utils/cacheManager');
 
-// Processar mensagem de cliente (API pública)
-exports.processMessage = async (req, res) => {
-  try {
-    const tenantId = req.tenant._id;
-    const { phone, message } = req.body;
-    
-    // Primeiro, armazenar a mensagem na conversa
-    let conversation = await Conversation.findOne({ tenantId, phone });
-    
-    if (!conversation) {
-      // Criar nova conversa se não existir
-      conversation = new Conversation({
+/**
+ * Serviço para gerenciamento do catálogo
+ */
+const catalogService = {
+  /**
+   * Busca produtos com filtros e opções de ordenação
+   * @param {string} tenantId - ID do tenant
+   * @param {Object} filters - Filtros a serem aplicados
+   * @param {Object} options - Opções de paginação e ordenação
+   * @returns {Promise<Object>} Produtos e informações de paginação
+   */
+  getProducts: async (tenantId, filters = {}, options = {}) => {
+    try {
+      const query = { tenantId, ...filters };
+      
+      const page = options.page || 1;
+      const limit = options.limit || 10;
+      const skip = (page - 1) * limit;
+      
+      const sort = options.sort || { name: 1 };
+      
+      // Executar consulta
+      const [products, total] = await Promise.all([
+        Catalog.find(query)
+          .populate('category', 'name slug')
+          .sort(sort)
+          .skip(skip)
+          .limit(limit),
+        
+        Catalog.countDocuments(query)
+      ]);
+      
+      return {
+        products,
+        pagination: {
+          page,
+          limit,
+          total,
+          pages: Math.ceil(total / limit)
+        }
+      };
+    } catch (error) {
+      logger.error(`Erro ao buscar produtos para tenant ${tenantId}:`, error);
+      throw new Error('Erro ao buscar produtos');
+    }
+  },
+  
+  /**
+   * Busca detalhes de um produto específico
+   * @param {string} tenantId - ID do tenant
+   * @param {string} productId - ID do produto
+   * @param {boolean} includeOptions - Incluir opções do produto
+   * @returns {Promise<Object>} Detalhes do produto
+   */
+  getProductDetails: async (tenantId, productId, includeOptions = false) => {
+    try {
+      // Tentar obter do cache
+      const cacheKey = `tenant_${tenantId}_product_${productId}`;
+      const cachedProduct = cacheManager.get(cacheKey);
+      
+      if (cachedProduct) {
+        return cachedProduct;
+      }
+      
+      // Buscar produto
+      const product = await Catalog.findOne({
+        _id: productId,
+        tenantId
+      }).populate('category', 'name slug');
+      
+      if (!product) {
+        throw new Error('Produto não encontrado');
+      }
+      
+      let additionalData = {};
+      
+      // Carregar opções relacionadas se solicitado
+      if (includeOptions) {
+        if (product.productType === 'pizza') {
+          const [sizes, crusts] = await Promise.all([
+            ProductOption.find({
+              tenantId,
+              type: 'pizza-size',
+              active: true
+            }).sort({ price: 1 }),
+            
+            ProductOption.find({
+              tenantId,
+              type: 'pizza-crust',
+              active: true
+            }).sort({ price: 1 })
+          ]);
+          
+          additionalData = { sizes, crusts };
+        } else if (product.productType === 'hamburger') {
+          const addons = await ProductOption.find({
+            tenantId,
+            type: 'burger-addon',
+            active: true
+          }).sort({ price: 1 });
+          
+          additionalData = { addons };
+        }
+      }
+      
+      // Combinar produto com dados adicionais
+      const productWithOptions = {
+        ...product.toObject(),
+        ...additionalData
+      };
+      
+      // Salvar no cache
+      cacheManager.set(cacheKey, productWithOptions);
+      
+      return productWithOptions;
+    } catch (error) {
+      logger.error(`Erro ao buscar detalhes do produto ${productId}:`, error);
+      throw error;
+    }
+  },
+  
+  /**
+   * Cria um novo produto
+   * @param {string} tenantId - ID do tenant
+   * @param {Object} productData - Dados do produto
+   * @returns {Promise<Object>} Produto criado
+   */
+  createProduct: async (tenantId, productData) => {
+    try {
+      // Verificar se a categoria existe
+      const categoryExists = await Category.findOne({
+        _id: productData.category,
+        tenantId
+      });
+      
+      if (!categoryExists) {
+        throw new Error('Categoria não encontrada');
+      }
+      
+      // Criar produto
+      const product = new Catalog({
         tenantId,
-        phone,
-        messages: []
-      });
-    }
-    
-    // Adicionar mensagem do cliente
-    conversation.messages.push({
-      content: message,
-      isFromBot: false
-    });
-    
-    await conversation.save();
-    
-    // Processar mensagem com o serviço de bot
-    const botResponse = await botService.processMessage(tenantId, phone, message);
-    
-    if (botResponse) {
-      // Armazenar resposta do bot na conversa
-      conversation.messages.push({
-        content: botResponse,
-        isFromBot: true
+        ...productData
       });
       
-      await conversation.save();
+      await product.save();
+      
+      // Limpar caches relacionados
+      cacheManager.delByPrefix(`tenant_${tenantId}_products`);
+      cacheManager.delByPrefix(`tenant_${tenantId}_category_${productData.category}`);
+      
+      return product;
+    } catch (error) {
+      logger.error(`Erro ao criar produto para tenant ${tenantId}:`, error);
+      throw error;
     }
-    
-    res.json({
-      success: true,
-      response: botResponse
-    });
-  } catch (error) {
-    logger.error(`Erro ao processar mensagem para tenant ${req.tenant._id}:`, error);
-    res.status(500).json({ error: 'Erro ao processar mensagem' });
-  }
-};
-
-// ==== ROTAS ADMINISTRATIVAS ====
-
-// Obter todas as conversas
-exports.getAllConversations = async (req, res) => {
-  try {
-    const tenantId = req.user.tenantId;
-    
-    // Paginação
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 10;
-    const skip = (page - 1) * limit;
-    
-    // Ordenação: conversas mais recentes primeiro
-    const sort = { updatedAt: -1 };
-    
-    // Executar consulta
-    const [conversations, total] = await Promise.all([
-      Conversation.find({ tenantId })
-        .select('phone updatedAt messages')
-        .sort(sort)
-        .skip(skip)
-        .limit(limit),
+  },
+  
+  /**
+   * Atualiza um produto existente
+   * @param {string} tenantId - ID do tenant
+   * @param {string} productId - ID do produto
+   * @param {Object} productData - Novos dados do produto
+   * @returns {Promise<Object>} Produto atualizado
+   */
+  updateProduct: async (tenantId, productId, productData) => {
+    try {
+      // Buscar produto existente
+      const product = await Catalog.findOne({
+        _id: productId,
+        tenantId
+      });
       
-      Conversation.countDocuments({ tenantId })
-    ]);
-    
-    // Para cada conversa, pegar apenas as últimas 3 mensagens
-    const conversationsWithLimitedMessages = conversations.map(conv => {
-      const conversation = conv.toObject();
-      
-      // Limitar mensagens para preview
-      if (conversation.messages.length > 3) {
-        conversation.messages = conversation.messages.slice(-3);
-        conversation.hasMoreMessages = true;
-      } else {
-        conversation.hasMoreMessages = false;
+      if (!product) {
+        throw new Error('Produto não encontrado');
       }
       
-      return conversation;
-    });
-    
-    res.json({
-      conversations: conversationsWithLimitedMessages,
-      pagination: {
-        page,
-        limit,
-        total,
-        pages: Math.ceil(total / limit)
+      // Verificar se a categoria existe (se for alterar)
+      if (productData.category && productData.category !== product.category.toString()) {
+        const categoryExists = await Category.findOne({
+          _id: productData.category,
+          tenantId
+        });
+        
+        if (!categoryExists) {
+          throw new Error('Categoria não encontrada');
+        }
       }
-    });
-  } catch (error) {
-    logger.error(`Erro ao listar conversas para tenant ${req.user.tenantId}:`, error);
-    res.status(500).json({ error: 'Erro ao buscar conversas' });
-  }
-};
-
-// Obter conversa por telefone
-exports.getConversationByPhone = async (req, res) => {
-  try {
-    const tenantId = req.user.tenantId;
-    const phone = req.params.phone;
-    
-    const conversation = await Conversation.findOne({ tenantId, phone });
-    
-    if (!conversation) {
-      return res.status(404).json({ error: 'Conversa não encontrada' });
-    }
-    
-    res.json({ conversation });
-  } catch (error) {
-    logger.error(`Erro ao buscar conversa do telefone ${req.params.phone}:`, error);
-    res.status(500).json({ error: 'Erro ao buscar conversa' });
-  }
-};
-
-// Obter estatísticas de conversas
-exports.getConversationStats = async (req, res) => {
-  try {
-    const tenantId = req.user.tenantId;
-    
-    // Período: hoje, semana, mês
-    const period = req.query.period || 'week';
-    let startDate = new Date();
-    
-    switch (period) {
-      case 'today':
-        startDate.setHours(0, 0, 0, 0);
-        break;
-      case 'week':
-        startDate.setDate(startDate.getDate() - 7);
-        break;
-      case 'month':
-        startDate.setMonth(startDate.getMonth() - 1);
-        break;
-      default:
-        startDate.setDate(startDate.getDate() - 7);
-    }
-    
-    // Total de conversas
-    const totalConversations = await Conversation.countDocuments({ tenantId });
-    
-    // Conversas no período
-    const conversationsInPeriod = await Conversation.countDocuments({
-      tenantId,
-      updatedAt: { $gte: startDate }
-    });
-    
-    // Total de mensagens
-    const conversations = await Conversation.find({ tenantId });
-    let totalMessages = 0;
-    let botMessages = 0;
-    let userMessages = 0;
-    
-    conversations.forEach(conv => {
-      totalMessages += conv.messages.length;
       
-      conv.messages.forEach(msg => {
-        if (msg.isFromBot) {
-          botMessages++;
-        } else {
-          userMessages++;
+      // Atualizar campos
+      Object.keys(productData).forEach(key => {
+        if (productData[key] !== undefined) {
+          product[key] = productData[key];
         }
       });
-    });
-    
-    // Responder com estatísticas
-    res.json({
-      stats: {
-        totalConversations,
-        conversationsInPeriod,
-        totalMessages,
-        botMessages,
-        userMessages,
-        avgMessagesPerConversation: totalConversations > 0 
-          ? (totalMessages / totalConversations).toFixed(2) 
-          : 0
-      }
-    });
-  } catch (error) {
-    logger.error(`Erro ao obter estatísticas de conversas para tenant ${req.user.tenantId}:`, error);
-    res.status(500).json({ error: 'Erro ao gerar estatísticas de conversas' });
+      
+      await product.save();
+      
+      // Limpar caches relacionados
+      cacheManager.delByPrefix(`tenant_${tenantId}_products`);
+      cacheManager.delByPrefix(`tenant_${tenantId}_category_`);
+      cacheManager.delByPrefix(`tenant_${tenantId}_product_${product._id}`);
+      
+      return product;
+    } catch (error) {
+      logger.error(`Erro ao atualizar produto ${productId}:`, error);
+      throw error;
+    }
   }
 };
 
-// Enviar mensagem para telefone
-exports.sendMessageToPhone = async (req, res) => {
-  try {
-    const tenantId = req.user.tenantId;
-    const phone = req.params.phone;
-    const { message } = req.body;
-    
-    // Verificar se conversa existe
-    let conversation = await Conversation.findOne({ tenantId, phone });
-    
-    if (!conversation) {
-      // Criar nova conversa
-      conversation = new Conversation({
-        tenantId,
-        phone,
-        messages: []
-      });
-    }
-    
-    // Adicionar mensagem do admin
-    const adminMessage = {
-      content: `[ADMIN: ${req.user.name}] ${message}`,
-      isFromBot: true
-    };
-    
-    conversation.messages.push(adminMessage);
-    await conversation.save();
-    
-    // Enviar mensagem via serviço de bot
-    const sent = await botService.sendMessage(tenantId, phone, message);
-    
-    res.json({
-      success: sent,
-      message: sent ? 'Mensagem enviada com sucesso' : 'Mensagem armazenada, mas falha ao enviar'
-    });
-  } catch (error) {
-    logger.error(`Erro ao enviar mensagem para ${req.params.phone}:`, error);
-    res.status(500).json({ error: 'Erro ao enviar mensagem' });
-  }
-};
+module.exports = catalogService;

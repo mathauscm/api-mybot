@@ -1,237 +1,171 @@
 const Conversation = require('../models/conversation');
-const botService = require('../services/botService');
+const Tenant = require('../models/tenant');
 const logger = require('../utils/logger');
+const axios = require('axios'); // Você precisará adicionar esta dependência
 
-// Processar mensagem de cliente (API pública)
-exports.processMessage = async (req, res) => {
-  try {
-    const tenantId = req.tenant._id;
-    const { phone, message } = req.body;
-    
-    // Primeiro, armazenar a mensagem na conversa
-    let conversation = await Conversation.findOne({ tenantId, phone });
-    
-    if (!conversation) {
-      // Criar nova conversa se não existir
-      conversation = new Conversation({
-        tenantId,
-        phone,
-        messages: []
-      });
-    }
-    
-    // Adicionar mensagem do cliente
-    conversation.messages.push({
-      content: message,
-      isFromBot: false
-    });
-    
-    await conversation.save();
-    
-    // Processar mensagem com o serviço de bot
-    const botResponse = await botService.processMessage(tenantId, phone, message);
-    
-    if (botResponse) {
-      // Armazenar resposta do bot na conversa
-      conversation.messages.push({
-        content: botResponse,
-        isFromBot: true
-      });
+/**
+ * Serviço para gerenciamento do bot
+ */
+const botService = {
+  /**
+   * Processa mensagem do cliente
+   * @param {string} tenantId - ID do tenant
+   * @param {string} phone - Número de telefone do cliente
+   * @param {string} message - Mensagem recebida
+   * @returns {Promise<string>} Resposta do bot
+   */
+  processMessage: async (tenantId, phone, message) => {
+    try {
+      logger.info(`Processando mensagem para tenant ${tenantId}, telefone ${phone}`);
       
-      await conversation.save();
-    }
-    
-    res.json({
-      success: true,
-      response: botResponse
-    });
-  } catch (error) {
-    logger.error(`Erro ao processar mensagem para tenant ${req.tenant._id}:`, error);
-    res.status(500).json({ error: 'Erro ao processar mensagem' });
-  }
-};
-
-// ==== ROTAS ADMINISTRATIVAS ====
-
-// Obter todas as conversas
-exports.getAllConversations = async (req, res) => {
-  try {
-    const tenantId = req.user.tenantId;
-    
-    // Paginação
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 10;
-    const skip = (page - 1) * limit;
-    
-    // Ordenação: conversas mais recentes primeiro
-    const sort = { updatedAt: -1 };
-    
-    // Executar consulta
-    const [conversations, total] = await Promise.all([
-      Conversation.find({ tenantId })
-        .select('phone updatedAt messages')
-        .sort(sort)
-        .skip(skip)
-        .limit(limit),
+      // Aqui você implementaria a lógica de processamento da mensagem
+      // Poderia ser integração com ChatGPT, DialogFlow, ou outro serviço
       
-      Conversation.countDocuments({ tenantId })
-    ]);
-    
-    // Para cada conversa, pegar apenas as últimas 3 mensagens
-    const conversationsWithLimitedMessages = conversations.map(conv => {
-      const conversation = conv.toObject();
+      // Exemplo simples com respostas pré-definidas
+      let response = '';
       
-      // Limitar mensagens para preview
-      if (conversation.messages.length > 3) {
-        conversation.messages = conversation.messages.slice(-3);
-        conversation.hasMoreMessages = true;
+      const lowerMessage = message.toLowerCase();
+      
+      if (lowerMessage.includes('cardápio') || lowerMessage.includes('menu')) {
+        response = 'Você pode ver nosso cardápio completo em nosso site ou digitar a categoria: Pizza, Hambúrguer, Bebidas';
+      } else if (lowerMessage.includes('horário') || lowerMessage.includes('funcionamento')) {
+        response = 'Estamos abertos de terça a domingo, das 18h às 23h.';
+      } else if (lowerMessage.includes('entrega') || lowerMessage.includes('delivery')) {
+        response = 'Fazemos entregas em até 45 minutos para a região central. Taxa de entrega a partir de R$ 5,00.';
+      } else if (lowerMessage.includes('olá') || lowerMessage.includes('oi') || lowerMessage.includes('bom dia') || lowerMessage.includes('boa tarde') || lowerMessage.includes('boa noite')) {
+        response = `Olá! Bem-vindo ao nosso atendimento. Como posso ajudar?`;
       } else {
-        conversation.hasMoreMessages = false;
+        response = 'Não entendi sua mensagem. Por favor, tente novamente ou escolha uma das opções: Cardápio, Horários, Entrega ou Pedido.';
       }
       
-      return conversation;
-    });
-    
-    res.json({
-      conversations: conversationsWithLimitedMessages,
-      pagination: {
-        page,
-        limit,
-        total,
-        pages: Math.ceil(total / limit)
-      }
-    });
-  } catch (error) {
-    logger.error(`Erro ao listar conversas para tenant ${req.user.tenantId}:`, error);
-    res.status(500).json({ error: 'Erro ao buscar conversas' });
-  }
-};
-
-// Obter conversa por telefone
-exports.getConversationByPhone = async (req, res) => {
-  try {
-    const tenantId = req.user.tenantId;
-    const phone = req.params.phone;
-    
-    const conversation = await Conversation.findOne({ tenantId, phone });
-    
-    if (!conversation) {
-      return res.status(404).json({ error: 'Conversa não encontrada' });
+      return response;
+    } catch (error) {
+      logger.error(`Erro ao processar mensagem para tenant ${tenantId}:`, error);
+      return 'Desculpe, houve um erro no processamento da sua mensagem. Por favor, tente novamente mais tarde.';
     }
-    
-    res.json({ conversation });
-  } catch (error) {
-    logger.error(`Erro ao buscar conversa do telefone ${req.params.phone}:`, error);
-    res.status(500).json({ error: 'Erro ao buscar conversa' });
-  }
-};
-
-// Obter estatísticas de conversas
-exports.getConversationStats = async (req, res) => {
-  try {
-    const tenantId = req.user.tenantId;
-    
-    // Período: hoje, semana, mês
-    const period = req.query.period || 'week';
-    let startDate = new Date();
-    
-    switch (period) {
-      case 'today':
-        startDate.setHours(0, 0, 0, 0);
-        break;
-      case 'week':
-        startDate.setDate(startDate.getDate() - 7);
-        break;
-      case 'month':
-        startDate.setMonth(startDate.getMonth() - 1);
-        break;
-      default:
-        startDate.setDate(startDate.getDate() - 7);
-    }
-    
-    // Total de conversas
-    const totalConversations = await Conversation.countDocuments({ tenantId });
-    
-    // Conversas no período
-    const conversationsInPeriod = await Conversation.countDocuments({
-      tenantId,
-      updatedAt: { $gte: startDate }
-    });
-    
-    // Total de mensagens
-    const conversations = await Conversation.find({ tenantId });
-    let totalMessages = 0;
-    let botMessages = 0;
-    let userMessages = 0;
-    
-    conversations.forEach(conv => {
-      totalMessages += conv.messages.length;
+  },
+  
+  /**
+   * Envia mensagem para o cliente
+   * @param {string} tenantId - ID do tenant
+   * @param {string} phone - Número de telefone do cliente
+   * @param {string} message - Mensagem a ser enviada
+   * @returns {Promise<boolean>} Status do envio
+   */
+  sendMessage: async (tenantId, phone, message) => {
+    try {
+      logger.info(`Enviando mensagem para tenant ${tenantId}, telefone ${phone}`);
       
-      conv.messages.forEach(msg => {
-        if (msg.isFromBot) {
-          botMessages++;
-        } else {
-          userMessages++;
-        }
-      });
-    });
-    
-    // Responder com estatísticas
-    res.json({
-      stats: {
-        totalConversations,
-        conversationsInPeriod,
-        totalMessages,
-        botMessages,
-        userMessages,
-        avgMessagesPerConversation: totalConversations > 0 
-          ? (totalMessages / totalConversations).toFixed(2) 
-          : 0
+      // Buscar tenant para obter configurações específicas
+      const tenant = await Tenant.findById(tenantId);
+      
+      if (!tenant) {
+        logger.error(`Tenant ${tenantId} não encontrado ao enviar mensagem`);
+        return false;
       }
-    });
-  } catch (error) {
-    logger.error(`Erro ao obter estatísticas de conversas para tenant ${req.user.tenantId}:`, error);
-    res.status(500).json({ error: 'Erro ao gerar estatísticas de conversas' });
+      
+      // Aqui você implementaria a integração com WhatsApp, Telegram, ou outro serviço
+      // usando as configurações específicas do tenant
+      
+      // Exemplo de integração com API de terceiros
+      // As configurações poderiam vir do tenant.settings.whatsappIntegration
+      
+      // Simulando envio
+      // Em produção, você faria uma chamada para um serviço real
+      // const response = await axios.post('https://api.whatsapp.com/send', {
+      //   phone,
+      //   message,
+      //   apiKey: tenant.settings.whatsappApiKey // Configuração específica do tenant
+      // });
+      
+      // return response.status === 200;
+      
+      // Por enquanto, apenas simulamos que o envio foi bem-sucedido
+      return true;
+    } catch (error) {
+      logger.error(`Erro ao enviar mensagem para ${phone} (tenant ${tenantId}):`, error);
+      return false;
+    }
+  },
+  
+  /**
+   * Notifica o proprietário sobre um novo pedido
+   * @param {string} tenantId - ID do tenant
+   * @param {Object} order - Pedido criado
+   * @returns {Promise<boolean>} Status da notificação
+   */
+  notifyNewOrder: async (tenantId, order) => {
+    try {
+      // Buscar o tenant para obter o número de contato do admin
+      const tenant = await Tenant.findById(tenantId);
+      
+      if (!tenant) {
+        logger.error(`Tenant ${tenantId} não encontrado ao notificar novo pedido`);
+        return false;
+      }
+      
+      // Usar o número de contato do tenant ou configuração específica
+      const adminPhone = tenant.contact.phone;
+      
+      // Verificar se existe um número de contato válido
+      if (!adminPhone) {
+        logger.error(`Tenant ${tenantId} não possui número de contato para notificações`);
+        return false;
+      }
+      
+      const message = `🔔 NOVO PEDIDO 🔔
+Número: ${order.orderNumber}
+Cliente: ${order.customer.name}
+Valor: R$ ${order.total.toFixed(2)}
+Status: Pendente
+
+Digite "ver ${order.orderNumber}" para detalhes`;
+      
+      return await botService.sendMessage(tenantId, adminPhone, message);
+    } catch (error) {
+      logger.error(`Erro ao notificar novo pedido para tenant ${tenantId}:`, error);
+      return false;
+    }
+  },
+  
+  /**
+   * Notifica o cliente sobre uma mudança de status no pedido
+   * @param {string} tenantId - ID do tenant
+   * @param {Object} order - Pedido atualizado
+   * @returns {Promise<boolean>} Status da notificação
+   */
+  notifyStatusChange: async (tenantId, order) => {
+    try {
+      // Buscar o tenant para verificar configurações específicas
+      const tenant = await Tenant.findById(tenantId);
+      
+      if (!tenant) {
+        logger.error(`Tenant ${tenantId} não encontrado ao notificar mudança de status`);
+        return false;
+      }
+      
+      // As mensagens de status também poderiam ser personalizadas por tenant
+      // Aqui usamos mensagens padrão para simplificar
+      const statusMessages = {
+        'confirmed': 'Seu pedido foi confirmado e está sendo preparado.',
+        'preparing': 'Seu pedido está sendo preparado na cozinha.',
+        'delivering': 'Seu pedido saiu para entrega! Chega em breve.',
+        'completed': 'Seu pedido foi entregue. Bom apetite! Agradecemos a preferência.',
+        'cancelled': 'Seu pedido foi cancelado. Entre em contato para mais informações.'
+      };
+      
+      const message = `🔔 ATUALIZAÇÃO DE PEDIDO 🔔
+Número: ${order.orderNumber}
+Status: ${order.status}
+
+${statusMessages[order.status] || ''}`;
+      
+      return await botService.sendMessage(tenantId, order.customer.phone, message);
+    } catch (error) {
+      logger.error(`Erro ao notificar mudança de status para pedido ${order.orderNumber}:`, error);
+      return false;
+    }
   }
 };
 
-// Enviar mensagem para telefone
-exports.sendMessageToPhone = async (req, res) => {
-  try {
-    const tenantId = req.user.tenantId;
-    const phone = req.params.phone;
-    const { message } = req.body;
-    
-    // Verificar se conversa existe
-    let conversation = await Conversation.findOne({ tenantId, phone });
-    
-    if (!conversation) {
-      // Criar nova conversa
-      conversation = new Conversation({
-        tenantId,
-        phone,
-        messages: []
-      });
-    }
-    
-    // Adicionar mensagem do admin
-    const adminMessage = {
-      content: `[ADMIN: ${req.user.name}] ${message}`,
-      isFromBot: true
-    };
-    
-    conversation.messages.push(adminMessage);
-    await conversation.save();
-    
-    // Enviar mensagem via serviço de bot
-    const sent = await botService.sendMessage(tenantId, phone, message);
-    
-    res.json({
-      success: sent,
-      message: sent ? 'Mensagem enviada com sucesso' : 'Mensagem armazenada, mas falha ao enviar'
-    });
-  } catch (error) {
-    logger.error(`Erro ao enviar mensagem para ${req.params.phone}:`, error);
-    res.status(500).json({ error: 'Erro ao enviar mensagem' });
-  }
-};
+module.exports = botService;

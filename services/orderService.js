@@ -1,237 +1,248 @@
-const Conversation = require('../models/conversation');
-const botService = require('../services/botService');
+const Order = require('../models/order');
+const Catalog = require('../models/catalog');
+const ProductOption = require('../models/productOption');
 const logger = require('../utils/logger');
 
-// Processar mensagem de cliente (API pública)
-exports.processMessage = async (req, res) => {
-  try {
-    const tenantId = req.tenant._id;
-    const { phone, message } = req.body;
-    
-    // Primeiro, armazenar a mensagem na conversa
-    let conversation = await Conversation.findOne({ tenantId, phone });
-    
-    if (!conversation) {
-      // Criar nova conversa se não existir
-      conversation = new Conversation({
-        tenantId,
-        phone,
-        messages: []
-      });
-    }
-    
-    // Adicionar mensagem do cliente
-    conversation.messages.push({
-      content: message,
-      isFromBot: false
-    });
-    
-    await conversation.save();
-    
-    // Processar mensagem com o serviço de bot
-    const botResponse = await botService.processMessage(tenantId, phone, message);
-    
-    if (botResponse) {
-      // Armazenar resposta do bot na conversa
-      conversation.messages.push({
-        content: botResponse,
-        isFromBot: true
-      });
-      
-      await conversation.save();
-    }
-    
-    res.json({
-      success: true,
-      response: botResponse
-    });
-  } catch (error) {
-    logger.error(`Erro ao processar mensagem para tenant ${req.tenant._id}:`, error);
-    res.status(500).json({ error: 'Erro ao processar mensagem' });
-  }
-};
-
-// ==== ROTAS ADMINISTRATIVAS ====
-
-// Obter todas as conversas
-exports.getAllConversations = async (req, res) => {
-  try {
-    const tenantId = req.user.tenantId;
-    
-    // Paginação
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 10;
-    const skip = (page - 1) * limit;
-    
-    // Ordenação: conversas mais recentes primeiro
-    const sort = { updatedAt: -1 };
-    
-    // Executar consulta
-    const [conversations, total] = await Promise.all([
-      Conversation.find({ tenantId })
-        .select('phone updatedAt messages')
-        .sort(sort)
-        .skip(skip)
-        .limit(limit),
-      
-      Conversation.countDocuments({ tenantId })
-    ]);
-    
-    // Para cada conversa, pegar apenas as últimas 3 mensagens
-    const conversationsWithLimitedMessages = conversations.map(conv => {
-      const conversation = conv.toObject();
-      
-      // Limitar mensagens para preview
-      if (conversation.messages.length > 3) {
-        conversation.messages = conversation.messages.slice(-3);
-        conversation.hasMoreMessages = true;
-      } else {
-        conversation.hasMoreMessages = false;
+/**
+ * Serviço para gerenciamento de pedidos
+ */
+const orderService = {
+  /**
+   * Cria um novo pedido
+   * @param {string} tenantId - ID do tenant
+   * @param {Object} orderData - Dados do pedido
+   * @returns {Promise<Object>} Pedido criado
+   */
+  createOrder: async (tenantId, orderData) => {
+    try {
+      // Validação de dados
+      if (!orderData.items || orderData.items.length === 0) {
+        throw { 
+          type: 'validation', 
+          message: 'Pedido deve conter pelo menos um item',
+          details: ['items']
+        };
       }
       
-      return conversation;
-    });
-    
-    res.json({
-      conversations: conversationsWithLimitedMessages,
-      pagination: {
-        page,
-        limit,
-        total,
-        pages: Math.ceil(total / limit)
+      if (!orderData.customer || !orderData.customer.name || !orderData.customer.phone) {
+        throw { 
+          type: 'validation', 
+          message: 'Dados do cliente incompletos',
+          details: ['customer']
+        };
       }
-    });
-  } catch (error) {
-    logger.error(`Erro ao listar conversas para tenant ${req.user.tenantId}:`, error);
-    res.status(500).json({ error: 'Erro ao buscar conversas' });
-  }
-};
-
-// Obter conversa por telefone
-exports.getConversationByPhone = async (req, res) => {
-  try {
-    const tenantId = req.user.tenantId;
-    const phone = req.params.phone;
-    
-    const conversation = await Conversation.findOne({ tenantId, phone });
-    
-    if (!conversation) {
-      return res.status(404).json({ error: 'Conversa não encontrada' });
-    }
-    
-    res.json({ conversation });
-  } catch (error) {
-    logger.error(`Erro ao buscar conversa do telefone ${req.params.phone}:`, error);
-    res.status(500).json({ error: 'Erro ao buscar conversa' });
-  }
-};
-
-// Obter estatísticas de conversas
-exports.getConversationStats = async (req, res) => {
-  try {
-    const tenantId = req.user.tenantId;
-    
-    // Período: hoje, semana, mês
-    const period = req.query.period || 'week';
-    let startDate = new Date();
-    
-    switch (period) {
-      case 'today':
-        startDate.setHours(0, 0, 0, 0);
-        break;
-      case 'week':
-        startDate.setDate(startDate.getDate() - 7);
-        break;
-      case 'month':
-        startDate.setMonth(startDate.getMonth() - 1);
-        break;
-      default:
-        startDate.setDate(startDate.getDate() - 7);
-    }
-    
-    // Total de conversas
-    const totalConversations = await Conversation.countDocuments({ tenantId });
-    
-    // Conversas no período
-    const conversationsInPeriod = await Conversation.countDocuments({
-      tenantId,
-      updatedAt: { $gte: startDate }
-    });
-    
-    // Total de mensagens
-    const conversations = await Conversation.find({ tenantId });
-    let totalMessages = 0;
-    let botMessages = 0;
-    let userMessages = 0;
-    
-    conversations.forEach(conv => {
-      totalMessages += conv.messages.length;
       
-      conv.messages.forEach(msg => {
-        if (msg.isFromBot) {
-          botMessages++;
-        } else {
-          userMessages++;
+      // Verificar e calcular valores dos itens
+      let subtotal = 0;
+      
+      // Processar cada item do pedido
+      for (let item of orderData.items) {
+        // Se tiver productId, verificar se o produto existe e está disponível
+        if (item.productId) {
+          const product = await Catalog.findOne({
+            _id: item.productId,
+            tenantId,
+            available: true
+          });
+          
+          if (!product) {
+            throw { 
+              type: 'validation', 
+              message: `Produto ${item.name} não encontrado ou indisponível`,
+              details: ['items']
+            };
+          }
+          
+          // Se for pizza com tamanho específico
+          if (product.productType === 'pizza' && item.options && item.options.length > 0) {
+            const sizeOption = item.options.find(opt => 
+              opt.name.toLowerCase().includes('tamanho') || 
+              opt.name.toLowerCase().includes('tam') || 
+              opt.name.toLowerCase().includes('size')
+            );
+            
+            if (sizeOption) {
+              // Verificar se o tamanho existe nas opções do produto
+              const sizeExists = product.sizesPrices.some(sp => 
+                sp.sizeName.toLowerCase() === sizeOption.name.toLowerCase()
+              );
+              
+              if (!sizeExists) {
+                throw { 
+                  type: 'validation', 
+                  message: `Tamanho de pizza inválido: ${sizeOption.name}`,
+                  details: ['items.options']
+                };
+              }
+            }
+          }
         }
-      });
-    });
-    
-    // Responder com estatísticas
-    res.json({
-      stats: {
-        totalConversations,
-        conversationsInPeriod,
-        totalMessages,
-        botMessages,
-        userMessages,
-        avgMessagesPerConversation: totalConversations > 0 
-          ? (totalMessages / totalConversations).toFixed(2) 
-          : 0
+        
+        // Calcular subtotal do item
+        const itemTotal = item.quantity * item.unitPrice;
+        
+        // Adicionar extras/opções
+        let optionsTotal = 0;
+        if (item.options && item.options.length > 0) {
+          optionsTotal = item.options.reduce((sum, opt) => sum + (opt.price || 0), 0) * item.quantity;
+        }
+        
+        subtotal += itemTotal + optionsTotal;
       }
-    });
-  } catch (error) {
-    logger.error(`Erro ao obter estatísticas de conversas para tenant ${req.user.tenantId}:`, error);
-    res.status(500).json({ error: 'Erro ao gerar estatísticas de conversas' });
+      
+      // Calcular total
+      const deliveryFee = orderData.deliveryFee || 0;
+      const total = subtotal + deliveryFee;
+      
+      // Gerar número de pedido
+      const orderNumber = await Order.generateOrderNumber(tenantId);
+      
+      // Criar o pedido
+      const order = new Order({
+        tenantId,
+        orderNumber,
+        status: 'pending',
+        customer: orderData.customer,
+        items: orderData.items,
+        paymentMethod: orderData.paymentMethod,
+        changeFor: orderData.changeFor,
+        deliveryFee,
+        subtotal,
+        total,
+        notes: orderData.notes
+      });
+      
+      await order.save();
+      
+      return order;
+    } catch (error) {
+      logger.error(`Erro ao criar pedido para tenant ${tenantId}:`, error);
+      throw error;
+    }
+  },
+  
+  /**
+   * Atualiza o status de um pedido
+   * @param {string} tenantId - ID do tenant
+   * @param {string} orderId - ID do pedido
+   * @param {string} status - Novo status
+   * @returns {Promise<Object>} Pedido atualizado
+   */
+  updateOrderStatus: async (tenantId, orderId, status) => {
+    try {
+      const order = await Order.findOne({
+        _id: orderId,
+        tenantId
+      });
+      
+      if (!order) {
+        throw new Error('Pedido não encontrado');
+      }
+      
+      // Validar transição de status
+      const validTransitions = {
+        'pending': ['confirmed', 'cancelled'],
+        'confirmed': ['preparing', 'cancelled'],
+        'preparing': ['delivering', 'completed', 'cancelled'],
+        'delivering': ['completed', 'cancelled'],
+        'completed': [],
+        'cancelled': []
+      };
+      
+      if (!validTransitions[order.status].includes(status)) {
+        throw new Error(`Não é possível alterar o status de '${order.status}' para '${status}'`);
+      }
+      
+      // Atualizar status
+      order.status = status;
+      await order.save();
+      
+      return order;
+    } catch (error) {
+      logger.error(`Erro ao atualizar status do pedido ${orderId}:`, error);
+      throw error;
+    }
+  },
+  
+  /**
+   * Obtém estatísticas de pedidos
+   * @param {string} tenantId - ID do tenant
+   * @param {Date} startDate - Data inicial
+   * @param {Date} endDate - Data final
+   * @returns {Promise<Object>} Estatísticas de pedidos
+   */
+  getOrderStatistics: async (tenantId, startDate, endDate) => {
+    try {
+      // Filtro de período
+      const dateFilter = {
+        tenantId,
+        createdAt: {
+          $gte: startDate,
+          $lte: endDate
+        }
+      };
+      
+      // Total de pedidos
+      const totalOrders = await Order.countDocuments(dateFilter);
+      
+      // Pedidos por status
+      const ordersByStatus = await Order.aggregate([
+        { $match: dateFilter },
+        {
+          $group: {
+            _id: '$status',
+            count: { $sum: 1 },
+            total: { $sum: '$total' }
+          }
+        }
+      ]);
+      
+      // Formatar resultado
+      const statusStats = {};
+      ordersByStatus.forEach(item => {
+        statusStats[item._id] = {
+          count: item.count,
+          total: item.total
+        };
+      });
+      
+      // Valor médio dos pedidos
+      const averageTicket = await Order.aggregate([
+        { $match: dateFilter },
+        {
+          $group: {
+            _id: null,
+            average: { $avg: '$total' }
+          }
+        }
+      ]);
+      
+      // Total de vendas
+      const totalSales = await Order.aggregate([
+        { $match: dateFilter },
+        {
+          $group: {
+            _id: null,
+            total: { $sum: '$total' }
+          }
+        }
+      ]);
+      
+      return {
+        period: {
+          start: startDate,
+          end: endDate
+        },
+        totalOrders,
+        byStatus: statusStats,
+        averageTicket: averageTicket.length > 0 ? averageTicket[0].average : 0,
+        totalSales: totalSales.length > 0 ? totalSales[0].total : 0
+      };
+    } catch (error) {
+      logger.error(`Erro ao gerar estatísticas para tenant ${tenantId}:`, error);
+      throw error;
+    }
   }
 };
 
-// Enviar mensagem para telefone
-exports.sendMessageToPhone = async (req, res) => {
-  try {
-    const tenantId = req.user.tenantId;
-    const phone = req.params.phone;
-    const { message } = req.body;
-    
-    // Verificar se conversa existe
-    let conversation = await Conversation.findOne({ tenantId, phone });
-    
-    if (!conversation) {
-      // Criar nova conversa
-      conversation = new Conversation({
-        tenantId,
-        phone,
-        messages: []
-      });
-    }
-    
-    // Adicionar mensagem do admin
-    const adminMessage = {
-      content: `[ADMIN: ${req.user.name}] ${message}`,
-      isFromBot: true
-    };
-    
-    conversation.messages.push(adminMessage);
-    await conversation.save();
-    
-    // Enviar mensagem via serviço de bot
-    const sent = await botService.sendMessage(tenantId, phone, message);
-    
-    res.json({
-      success: sent,
-      message: sent ? 'Mensagem enviada com sucesso' : 'Mensagem armazenada, mas falha ao enviar'
-    });
-  } catch (error) {
-    logger.error(`Erro ao enviar mensagem para ${req.params.phone}:`, error);
-    res.status(500).json({ error: 'Erro ao enviar mensagem' });
-  }
-};
+module.exports = orderService;
